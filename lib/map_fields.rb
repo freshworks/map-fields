@@ -52,7 +52,7 @@ module MapFields
     unless @map_fields_error
       @rows = []
       begin
-        CSV.foreach(session[:map_fields][:file]) do |row|
+        CSV.parse(content_of(session[:map_fields][:file])) do |row|
           @rows << row
           break if @rows.size == 10
         end
@@ -63,7 +63,7 @@ module MapFields
       if expected_fields.respond_to?(:call)
         expected_fields = expected_fields.call(params)
       end
-      @fields = ([nil] + expected_fields).inject({}){ |o, e| o.merge({e => o.size})}
+      @fields = (expected_fields).inject({}){ |o, e| o.merge({e => o.size})}
       @parameters = []
       options[:params].each do |param|
         @parameters += ParamsParser.parse(params, param)
@@ -73,6 +73,10 @@ module MapFields
 
   def mapped_fields
     @mapped_fields
+  end
+
+  def content_of csv_file
+     File.open(csv_file,'rb').read.force_encoding('utf-8').encode('utf-16', :undef => :replace, :invalid => :replace, :replace => '').encode('utf-8')
   end
 
   def fields_mapped?
@@ -137,7 +141,7 @@ module MapFields
 
     def each
       row_number = 1
-      CSV.foreach(@file) do |csv_row|
+      CSV.parse(content_of(@file)) do |csv_row|
         unless row_number == 1 && @ignore_first_row
           row = {}
           @mapping.each do |k,v|
