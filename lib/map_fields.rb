@@ -26,13 +26,15 @@ module MapFields
       end
 
       file_field = params[options[:file_field]]
+      file_name = "csv_#{Account.current.id}/#{Time.now.to_i}/#{file_field.original_filename}"
 
-      temp_path = File.join(Dir::tmpdir, "map_fields_#{Time.now.to_i}_#{$$}")
-      File.open(temp_path, 'wb') do |f|
-        f.write file_field.read
-      end
-
-      session[:map_fields][:file] = temp_path
+      AwsWrapper::S3Object.store(
+            file_name,
+            file_field.tempfile,
+            S3_CONFIG[:bucket],
+            :content_type => file_field.content_type
+      )
+      session[:map_fields][:file] = file_name
     else
       if session[:map_fields][:file].nil? || params[:fields].nil?
         session[:map_fields] = nil
@@ -42,28 +44,34 @@ module MapFields
         if expected_fields.respond_to?(:call)
           expected_fields = expected_fields.call(params)
         end
-        @mapped_fields = MappedFields.new(session[:map_fields][:file],
-                                          expected_fields,
-                                          params[:fields],
-                                          params[:ignore_first_row])
+        csv_file = AwsWrapper::S3Object.find(session[:map_fields][:file], S3_CONFIG[:bucket])
+        @mapped_fields = []
+        begin
+          CSVBridge.parse(content_of(csv_file)) do |row|
+             @mapped_fields << row
+          end
+        rescue CSVBridge::MalformedCSVError => e
+          @map_fields_error = e
+        end
       end
     end
 
     unless @map_fields_error
       @rows = []
       begin
-        CSV.parse(content_of(session[:map_fields][:file])) do |row|
-          @rows << row
-          break if @rows.size == 10
+        csv_file = AwsWrapper::S3Object.find(session[:map_fields][:file], S3_CONFIG[:bucket])
+        CSVBridge.parse(content_of(csv_file)) do |row|
+           @rows << row
+           break if @rows.size == 2
         end
-      rescue CSV::MalformedCSVError => e
+      rescue CSVBridge::MalformedCSVError => e
         @map_fields_error = e
       end
       expected_fields = self.map_fields_fields
       if expected_fields.respond_to?(:call)
         expected_fields = expected_fields.call(params)
       end
-      @fields = (expected_fields).inject({}){ |o, e| o.merge({e => o.size})}
+      @fields = (expected_fields).inject([]){ |o, e| o << [e, o.size]}
       @parameters = []
       options[:params].each do |param|
         @parameters += ParamsParser.parse(params, param)
@@ -76,7 +84,7 @@ module MapFields
   end
 
   def content_of csv_file
-     File.open(csv_file,'rb').read.force_encoding('utf-8').encode('utf-16', :undef => :replace, :invalid => :replace, :replace => '').encode('utf-8')
+    csv_file.read.force_encoding('utf-8').encode('utf-16', :undef => :replace, :invalid => :replace, :replace => '').encode('utf-8')
   end
 
   def fields_mapped?
@@ -91,7 +99,7 @@ module MapFields
   def map_fields_cleanup
     if @mapped_fields
       if session[:map_fields][:file]
-        File.delete(session[:map_fields][:file])
+        AwsWrapper::S3Object.delete(session[:map_fields][:file], S3_CONFIG[:bucket])
       end
       session[:map_fields] = nil
       @mapped_fields = nil
@@ -117,10 +125,10 @@ module MapFields
       @file = file
       @fields = fields
       @mapping = {}
-      @ignore_first_row = ignore_first_row == '1'
+      @ignore_first_row = ignore_first_row
 
       mapping.each do |k,v|
-        unless v.to_i == 0
+        #unless v.to_i == 0
           #Numeric mapping
           @mapping[v.to_i - 1] = k.to_i - 1
           #Text mapping
@@ -131,7 +139,7 @@ module MapFields
                                       gsub(/[^a-zA-Z0-9_]+/, '').
                                       to_sym
           @mapping[sym_key] = k.to_i - 1
-        end
+        #end
       end
     end
 
@@ -141,7 +149,7 @@ module MapFields
 
     def each
       row_number = 1
-      CSV.parse(content_of(@file)) do |csv_row|
+      CSVBridge.foreach(@file) do |csv_row|
         unless row_number == 1 && @ignore_first_row
           row = {}
           @mapping.each do |k,v|
@@ -175,28 +183,28 @@ module MapFields
     end
 
     private
-    def self.check_values(value, &block)
-      result = []
-      if value.kind_of?(Hash)
-        value.each do |k,v|
-          check_values(v) do |k2,v2|
-            result << ["[#{k.to_s}]#{k2}", v2]
+      def self.check_values(value, &block)
+        result = []
+        if value.kind_of?(Hash)
+          value.each do |k,v|
+            check_values(v) do |k2,v2|
+              result << ["[#{k.to_s}]#{k2}", v2]
+            end
           end
-        end
-      elsif value.kind_of?(Array)
-        value.each do |v|
-          check_values(v) do |k2, v2|
-            result << ["[]#{k2}", v2]
+        elsif value.kind_of?(Array)
+          value.each do |v|
+            check_values(v) do |k2, v2|
+              result << ["[]#{k2}", v2]
+            end
           end
+        else
+          result << ["", value]
         end
-      else
-        result << ["", value]
-      end
-      result.each do |arr|
-        yield arr[0], arr[1]
+        result.each do |arr|
+          yield arr[0], arr[1]
+        end
       end
     end
-  end
 end
 
 if defined?(Rails) and defined?(ActionController)
